@@ -1,0 +1,362 @@
+---
+title: "CAR Models"
+author: "KM Wambui"
+subtitle: using Zimbabwe DHS data
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment=NA, tidy = T)
+## load the packages needed for this module
+library(dplyr) ## package for data manipulation
+library(ggplot2)
+library(rgeos) ## Geomegry Engine- Open Source (GEOS)
+library(maptools) ##  R package with useful map tools
+library(broom) ## for converting a map to a data frame
+library(rgdal) ## Geospatial Data Analysis Library (GDAL)"
+library(rgeos) # # "Geomegry Engine- Open Source (GEOS)" -- check your shape file
+library(spdep)
+library(data.table)
+library(haven) ## read in stata files
+library("PerformanceAnalytics") ## EDA
+library(INLA) ## inla
+
+## remove the data in the environment
+rm(list = ls())
+```
+
+# Shape files in R
+
+## Reading and exporting? the shape file
+
+```{r}
+zim_shp <- maptools::readShapePoly("zim_shape/ZWE_adm2.shp",
+                                        IDvar="ID_2")
+plot(zim_shp, border="red", axes=TRUE, las=1 )
+```
+
+
+## What R is reccommending
+
+```{r}
+zim_OGR <-  rgdal::readOGR("zim_shape/ZWE_adm2.shp")
+plot(zim_OGR, border="blue", axes=TRUE, las=1)
+```
+
+We need to check our shape file to see if the spatial geometry is valid and the `gIsValid` function looks at each polygon, and makes sure it doesn’t break any topological rules. Ideally, all of the geometry is valid and the total number of polygons that fail the validity tests is 0.
+
+```{r}
+zim_valid <- data.table(valid=gIsValid(zim_OGR,byid=TRUE))
+sum(zim_valid$valid==F)
+```
+
+# Zimbabwe HAZ (Stunting) CAR Model
+## Load the data
+The data is extracted from the Zimbabwean DHS. Our outcome variable is Stunting predicted by (Variable selection done earlier);
+
+1) Employed - Employment status of the parent
+2) b19 - Age of the child
+3) Education - Education level of the parent
+4) b4 - Sex of the child
+5) v025 - Place of residence Urban or Rural
+6) BMI - BMI calculated earlier
+
+```{r}
+#zim_child_data <- haven::read_dta("data/Data2.dta")
+zim_child_data <- readstata13::read.dta13("data/Data2.dta")
+#dplyr::glimpse(zim_child_data , width = 5)
+```
+
+## Explolatory Data Analysis
+
+```{r}
+## EDA
+eda_data <- zim_child_data %>% 
+  select(Stunting, Employed, b19, Education,  BMI)
+PerformanceAnalytics::chart.Correlation(eda_data, histogram=TRUE, pch=19)
+```
+
+
+## Regression model
+
+## Select the variables of interest
+
+What approaches can you use to select the variables of interest. 
+- Stepwise regression [1^]
+- Regularization methods [2^]
+
+[1^]: http://web.nchu.edu.tw/~numerical/course1012/ra/Applied_Regression_Analysis_A_Research_Tool.pdf
+[2^]: https://web.stanford.edu/~hastie/Papers/B67.2%20%282005%29%20301-320%20Zou%20&%20Hastie.pdf
+
+
+Here we have already selected the variables to use  and we use complete case data. 
+
+```{r}
+zim_child_model <- zim_child_data %>%  
+  select(id_2 , name_1 , name_2 , Stunting, Employed, b19, Education, b4, v025, BMI)
+zim_child_model <- zim_child_model[complete.cases(zim_child_model),]
+
+glimpse(zim_child_model)
+```
+
+
+Check whether the ID_2 on the shape file corresponds to what you have in your data
+
+```{r}
+table(zim_shp@data$ID_2 %in% zim_child_model$id_2)
+table(zim_shp@data$NAME_2 %in% zim_child_model$name_2)
+```
+
+
+## Linear regression model
+
+```{r}
+## Define the formula of the model
+form_fit <- Stunting ~ Employed +b19  +  as.factor(Education) + b4+ v025+ BMI
+
+## fit the model
+lin_mod <- glm(form_fit, 
+               data=zim_child_data, 
+               family=gaussian(link="identity"))
+```
+
+Extract the summary statistics from the model. What do the estimates mean?
+
+```{r}
+summary(lin_mod)$coefficient
+AIC(lin_mod)  # AIC => 17272
+BIC(lin_mod)  # BIC => 17333
+```
+
+
+## Check for the assumptions
+We focus on the  Residuals vs Fitted values and the  Normal Q-Q. This will inform our decision on whether the outcome has met the assumptions to be used in further spatial models
+
+
+```{r}
+par(mfrow = c(2,2)) # display a unique layout for all graphs
+plot(lin_mod)
+par(mfrow = c(1,1)) 
+```
+
+
+\newpage
+
+# CAR model in INLA 
+
+- INLA is a nice "fast" alternative to MCMC for fitting Bayesian models [^1] . 
+
+
+It uses the Integrated Nested Laplace Approximation, a deterministic Bayesian method [^2] and a very nice book here by Marta Blangiardo [^3].
+
+[^1]: https://www.precision-analytics.ca/blog/a-gentle-inla-tutorial/
+[^2]: http://www.r-inla.org/download
+[^3       ]:http://www.r-inla.org/books
+
+
+## Normal linear model in INLA
+In the formula below  1 means that the model includes the intercept and
+
+```{r , tidy=FALSE}
+form_fit <-  Stunting ~1+ Employed +b19  + 
+  as.factor(Education) + b4+ v025+ BMI
+
+model_linear <- inla(form_fit,
+                     family="gaussian",
+                     data=zim_child_model,
+                    control.compute=list(dic=TRUE, waic=TRUE))
+```
+
+
+## Extracting the model summaries
+
+Here we compare our glm model with the linear model from INLA, are they similar?
+
+
+```{r}
+summary(model_linear)
+summary(lin_mod)
+```
+
+Extracting the summary of the fixed effects
+
+```{r}
+round(model_linear$summary.fixed[,1:5],3)
+```
+
+
+```{r}
+par(mfrow = c(2,2)) # display a unique layout for all graphs
+## Posterior density plot for the intercepts
+plot(model_linear$marginals.fixed[[1]],
+     type="l",
+     main="",
+     ylab="",
+     xlab=expression(beta[0]))
+plot(model_linear$marginals.fixed[[2]],
+     type="l",
+     main="",
+     ylab="",
+     xlab=expression(beta[1]))
+par(mfrow = c(1,1))
+```
+
+
+## Spatial Model in INLA
+
+Remember the importance of CAR models , to adjust for the neighbouring effect. Sharing a common border within the map. We extract the matrix to represent the structure of the neighbours.
+First we convert our neighbour map to an `inla` integrated map , a map that INLA can use to fit its model
+
+```{r}
+zim_nb<- spdep::poly2nb(zim_shp)
+
+nb2INLA("zim_shape/zim_inla.graph", zim_nb)
+zim_adj <- paste(getwd(),"/zim_shape/zim_inla.graph", sep="")
+```
+
+Then we generate the adjacency matrix  for the ZIM example: in the plot below rows and columns identify areas; squares identify neighbors 
+
+
+```{r}
+H <- inla.read.graph(filename="zim_shape/zim_inla.graph")
+image(inla.graph2matrix(H),xlab="",ylab="")
+```
+
+## Fitting CAR in INLA
+
+After having defined our neighbourhood structure, then we need to specify the formula for the model, through
+
+```{r}
+formula_inla <- Stunting ~ 1 + as.factor(Employed) +
+  b19  + as.factor(Education) + b4+ v025+ BMI+
+  
+  ##our CAR specification
+  f(id_2, model="bym",graph=zim_adj, scale.model=TRUE,
+    ## spefiying the priors for the unstri and str 
+                     hyper=list(prec.unstruct=list(prior="loggamma",param=c(1,0.001)), 
+                                prec.spatial=list(prior="loggamma",param=c(1,0.001))))
+
+```
+
+
+where `id_2` represents the identifiers for the locations and through the graph option we include the name of the object containing the neighborhood structure. Note that with f(ID, model="bym",...) R-INLA parameterizes 
+
+$${{\xi }_{i}}={{u}_{i}}+{{\upsilon }_{i}}$$
+
+
+By default, minimally informative priors are specified on the log of the unstructured effect precision $\log \left( {{\tau }_{\upsilon }} \right)\sim \log Gamma\left( 1,0.0005 \right)$ and the log of the structured  effect precision $\log \left( {{u}_{\upsilon }} \right)\sim \log Gamma\left( 1,0.0005 \right)$ 
+
+```{r , tidy=FALSE}
+model_inla <- inla(formula_inla,family="gaussian",
+                     data=zim_child_model,
+                     control.compute=list(dic=TRUE))
+ 
+
+```
+
+
+For model comparison and best fit, we use the Deviance Information   Criterion (DIC), where the small DIC was considered better. DIC is defined as $\overset{-}{\mathop{D}}\,\left( \theta  \right)+pD$ where $\overset{-}{\mathop{D}}\,\left( \theta  \right)=E\left[ D(\theta )|y \right]$ which is the posterior mean of the deviance, $D(\theta )$. $pD$ is the difference in the posterior mean deviance and the deviance evaluated at the posterior mean of the parameters, $pD = \mathop D\limits^ -  \left( \theta  \right) - D\left( {E\left( {\theta |y} \right)} \right)$. 
+
+RInla Model --> DIC 17218.91(pd=15.09)
+
+Linear model--> DIC=17272.83(pd=9.444)
+
+```{r}
+summary(model_inla) #inla --> DIC 17218.91(pd=15.09) ##linear model--> DIC=17272.83(pd=9.444)
+```
+
+
+## Summary of the fixed effect
+
+```{r}
+round(model_inla$summary.fixed,3)
+```
+
+
+## Summary of the random effects
+
+
+```{r}
+round(head(model_inla$summary.random$id_2),3)
+```
+
+
+## Plotting the estimates on map
+
+For this exercise, we plot the probability of having high HAZ in ZIM to compare with out BUGs model. First extract the marginals of the random effects
+
+
+```{r}
+csi <- model_inla$marginals.random$id_2[1:60]
+```
+
+Then create the  posterior probability using `inla.pmarginal` function. 
+
+```{r}
+# *** Code for posterior probablity
+a <- 0
+prob_csi <- lapply(csi, function(x) {1 - inla.pmarginal(a, x)})
+## for each location estimate the probability in continous
+cont_prob_cs1 <- data.frame(maps_cont_prob_csi=unlist(prob_csi)) %>% 
+  tibble::rownames_to_column("ID_2") %>% 
+  mutate(ID_2=gsub("index.","",ID_2))
+
+maps_cont_prob_csi <- cont_prob_cs1
+```
+
+
+Or create categories if you wish
+
+```{r , eval=F}
+# for each location estimate the probability in groups
+prob_csi_cutoff <- c(0,0.2,0.4,0.6,0.8,1) ## can change accordingly
+cat_prob_csi <- cut(unlist(prob_csi),
+                    breaks=prob_csi_cutoff, 
+                    include.lowest=TRUE)
+
+
+maps_cat_prob_csi <- data.frame(ID_2=unique(zim_child_model$id_2), ## check whether it joins well
+                                cat_prob_csi=cat_prob_csi)
+maps_cat_prob_csi$ID_2 <- as.character(maps_cat_prob_csi$ID_2)
+```
+
+
+Eventually, we join our posterior probabilities to the data
+
+```{r , tidy=F ,, message=FALSE, warning=FALSE }
+zim_shp_df <- broom::tidy(zim_shp, region = "ID_2")
+zim_shp_df <- zim_shp_df %>% 
+ # left_join(maps_cat_prob_csi, by=c("id"="ID_2")) %>% 
+  left_join(maps_cont_prob_csi, by=c("id"="ID_2"))
+
+glimpse(zim_shp_df)
+```
+
+
+We have our plot, is it similar
+
+
+```{r}
+p2 <- ggplot() + 
+  geom_polygon(data = zim_shp_df, aes(x = long, y = lat,
+                                      group = group,
+                                      fill = maps_cont_prob_csi), 
+               colour = "white") + theme_void() +
+  ggtitle("RINLA Fit") + labs(fill = "P of  high HAZ") +
+  scale_fill_continuous(high = "#fff7ec", low = "#7F0000")
+p2
+```
+
+
+\newpage
+
+
+```{r , echo=FALSE ,  fig.height=10, eval=FALSE}
+p1 <- p1 + scale_fill_continuous(high = "#fff7ec", low = "#7F0000") +
+  ggtitle("Open Bugs Fit") + labs(fill = "Average HAZ")
+gridExtra::grid.arrange(p1,p2, nrow=2 ) 
+```
+
